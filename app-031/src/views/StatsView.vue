@@ -4,10 +4,19 @@ import { useRoute } from 'vue-router'
 import { getJob } from '../lib/store'
 import boardsData from '../data/boards.json'
 import { pct, money } from '../lib/format'
+import { auditNumbering, groupRange } from '../lib/numbering'
 
 const route = useRoute()
 const job = computed(() => getJob(route.params.id as string))
 const result = computed(() => job.value?.result)
+
+const numberingAudit = computed(() => (job.value ? auditNumbering(job.value) : null))
+const cabinetStats = computed(() =>
+  (job.value?.numbering?.groups ?? []).map((g) => ({
+    ...g,
+    range: job.value?.numbering ? groupRange(job.value.numbering, g) : ''
+  }))
+)
 
 const totalPieces = computed(
   () => result.value?.sheets.reduce((a, s) => a + s.placements.length, 0) ?? 0
@@ -114,6 +123,30 @@ const utilMinMax = computed(() => {
           </div>
         </div>
         <p class="small muted">按零件开料后的实际净尺寸逐边累加（不含锯路）。</p>
+      </section>
+
+      <section class="panel">
+        <h3>按柜体件数与件号号段</h3>
+        <p class="small muted">件数与号段和排样图、标签、下料单使用同一套件号。</p>
+        <table class="grid">
+          <thead>
+            <tr><th>柜体/房间</th><th>件数</th><th>件号号段</th><th>溢出件</th></tr>
+          </thead>
+          <tbody>
+            <tr v-for="g in cabinetStats" :key="g.cabinet">
+              <td>{{ g.cabinet }}</td>
+              <td>{{ g.count }}</td>
+              <td><b>{{ g.range }}</b></td>
+              <td :class="{ bad: g.overflowCount > 0 }">{{ g.overflowCount || '' }}</td>
+            </tr>
+          </tbody>
+          <tfoot>
+            <tr><td>合计</td><td><b>{{ totalPieces }}</b></td><td></td><td></td></tr>
+          </tfoot>
+        </table>
+        <p v-if="numberingAudit && !numberingAudit.ok" class="small bad">
+          这套号与别处不一致：{{ numberingAudit.problems.map((p) => p.problem).join('；') }}
+        </p>
       </section>
 
       <section class="panel">

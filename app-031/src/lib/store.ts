@@ -1,10 +1,11 @@
 // 全局状态：Vue reactive 单例 + localStorage 持久化（无 Pinia/Vuex）
 import { reactive, computed } from 'vue'
-import type { Board, Job, NestResult, Part, RegisteredOffcut, SheetResult } from '../types'
+import type { Board, Job, NestResult, NumberingPlan, NumberingSpec, Part, RegisteredOffcut, SheetResult } from '../types'
 import { nestJob } from './packing'
 import { rebuildFromPlacements } from './cuts'
 import { guillotineViolation } from './geometry'
 import { uid } from './format'
+import { buildNumbering, DEFAULT_SPEC, verifyCuts, type CutReplayResult } from './numbering'
 import boardsData from '../data/boards.json'
 
 const JOBS_KEY = 'fco.jobs.v1'
@@ -41,9 +42,52 @@ function persist(): void {
 
 function init(): void {
   if (state.loaded) return
-  state.jobs = load<Job[]>(JOBS_KEY, [])
+  const rawJobs = load<Job[]>(JOBS_KEY, [])
+  let touched = false
+  state.jobs = rawJobs.map((j) => {
+    const nj = normalizeJob(j)
+    if (nj.migrated) touched = true
+    return nj.job
+  })
   state.offcuts = load<RegisteredOffcut[]>(OFFCUTS_KEY, [])
   state.loaded = true
+  if (touched) persist()
+}
+
+/**
+ * 兼容旧项目：缺字段补默认（缺字段不能打不开）；
+ * 有排样结果但没有柜体/前缀这一套号时，按默认规则重排一套并标 source='default'，
+ * 页面上必须标明「这批号是重排出来的」，老 seq 绝不当新号用。
+ */
+export function normalizeJob(job: Job): { job: Job; migrated: boolean } {
+  let migrated = false
+  if (!Array.isArray(job.boards)) job.boards = []
+  if (!Array.isArray(job.parts)) job.parts = []
+  if (typeof job.kerfMm !== 'number') {
+    job.kerfMm = boardsData.defaults.kerfMm
+    migrated = true
+  }
+  if (typeof job.trimMm !== 'number') {
+    job.trimMm = boardsData.defaults.trimMm
+    migrated = true
+  }
+  if (!Array.isArray(job.useOffcutIds)) job.useOffcutIds = []
+  if (typeof job.batchByCabinet !== 'boolean') job.batchByCabinet = false
+  for (const p of job.parts) {
+    if (!p.cabinet) {
+      p.cabinet = '未分组'
+      migrated = true
+    }
+  }
+  if (job.result && !job.numbering) {
+    try {
+      job.numbering = buildNumbering(DEFAULT_SPEC, job.result, 'default')
+      migrated = true
+    } catch {
+      // 结果结构异常也不阻断打开
+    }
+  }
+  return { job, migrated }
 }
 
 export function defaultBoards(): Board[] {
@@ -105,6 +149,7 @@ export function duplicateJob(id: string): Job | null {
   job.name = `${src.name} 副本`
   job.createdAt = Date.now()
   job.result = undefined
+  job.numbering = undefined
   state.jobs.unshift(job)
   persist()
   return job
@@ -152,8 +197,36 @@ export function runNest(job: Job): NestResult {
     }
   }
   job.result = result
+  // 重排内核只产摆法/刀路；显示号按当前规则补一套：
+  // 用户已有一套号（哪怕是 default）就按原规则重算，首次排样给默认号。
+  job.numbering = buildNumbering(job.numbering?.spec ?? DEFAULT_SPEC, result, job.numbering?.source ?? 'default')
   persist()
   return result
+}
+
+/**
+ * 整批重排号（一次写成）：先在内存里算好整套号 + 逐刀回看，全部通过才落库，
+ * 写到一半出错一律回退，摆法与刀路一行都不动。
+ * 返回逐刀回看结果；校验失败时号原样不动。
+ */
+export function applyNumbering(job: Job, specIn: NumberingSpec): { ok: boolean; plan?: NumberingPlan; replay?: CutReplayResult; error: string } {
+  if (!job.result) return { ok: false, error: '尚未排样，无法重排号' }
+  const snapshot = job.numbering ? JSON.parse(JSON.stringify(job.numbering)) as NumberingPlan : undefined
+  try {
+    const plan = buildNumbering(specIn, job.result, 'manual')
+    const replay = verifyCuts(job, plan)
+    if (!replay.ok) {
+      // 闸门拦住：号不允许落库
+      if (snapshot) job.numbering = snapshot
+      return { ok: false, replay, error: replay.problems.join('；') }
+    }
+    job.numbering = plan
+    persist()
+    return { ok: true, plan, replay, error: '' }
+  } catch (e) {
+    if (snapshot) job.numbering = snapshot
+    return { ok: false, error: e instanceof Error ? e.message : '重排失败，已回退' }
+  }
 }
 
 /** 手工微调：移动/交换后重新校验 guillotine 并重算刀路；非法返回错误信息。 */
@@ -363,13 +436,16 @@ export function exportJobJson(job: Job): string {
 export function importJobJson(json: string): Job | null {
   try {
     const obj = JSON.parse(json) as Job
-    if (!obj.parts || !obj.boards) return null
+    if (!obj || !Array.isArray(obj.parts) || !Array.isArray(obj.boards)) return null
     obj.id = uid('job')
     obj.createdAt = Date.now()
+    // 不导入别机上的排样（板 id 等可能对不上），缺字段与缺号由 normalizeJob 兼容补齐
     obj.result = undefined
-    state.jobs.unshift(obj)
+    obj.numbering = undefined
+    const { job } = normalizeJob(obj)
+    state.jobs.unshift(job)
     persist()
-    return obj
+    return job
   } catch {
     return null
   }

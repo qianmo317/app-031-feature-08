@@ -112,6 +112,50 @@ export interface NestResult {
   generatedAt: number
 }
 
+// ===== 零件重排号（标签/打印用，与排样内核完全解耦）=====
+
+/**
+ * 位数溢出时的两条路（二选一，后果必须认下）：
+ * - continue：溢出的几件接着往后单独排（全号显示），别的件一个不动；
+ *   代价：该柜柜内连号的整齐断在这一处。
+ * - widen：整批位数加宽后全部重排，连号完整；
+ *   代价：已贴标签、已发下料单与裁切步骤表全部对不上号，必须整批作废重打。
+ */
+export type OverflowPolicy = 'continue' | 'widen'
+
+export interface NumberingSpec {
+  prefix: string // 号前缀（用户自填，可空）
+  digits: number // 序号位数（不足补 0；超出位数时不截断）
+  startAt: number // 每个柜的起号（≥1）
+  overflow: OverflowPolicy
+}
+
+export interface NumberingTag {
+  full: string // 打印/显示用完整号（如 A-001）
+  cabinet: string
+  indexInCabinet: number // 该柜内第几件（1 起）
+  serial: number // 数字序号（= startAt + indexInCabinet - 1）
+  overflow: boolean // 是否超出指定位数
+}
+
+export interface NumberingGroup {
+  cabinet: string
+  count: number
+  firstSerial: number
+  lastSerial: number
+  overflowCount: number
+}
+
+export interface NumberingPlan {
+  spec: NumberingSpec
+  tags: Record<string, NumberingTag> // instanceId -> 号
+  groups: NumberingGroup[]
+  totalOverflow: number
+  appliedAt: number
+  /** manual=用户显式重排；default=旧项目读取时按默认规则补排，不能把老号当新号 */
+  source: 'manual' | 'default'
+}
+
 export interface Job {
   id: string
   name: string
@@ -123,6 +167,7 @@ export interface Job {
   useOffcutIds: string[] // 参与本单排样的登记余料
   batchByCabinet: boolean // 按柜体批次分组开料
   result?: NestResult
+  numbering?: NumberingPlan // 显示/打印号（可空；旧项目读取时按默认规则补排）
 }
 
 export interface RegisteredOffcut {

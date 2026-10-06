@@ -5,6 +5,13 @@ import type { Board, Job, Part } from '../types'
 import { nestJob } from './packing'
 import { simulate, countSawOps } from './cuts'
 import { guillotineViolation, type Rect } from './geometry'
+import {
+  DEFAULT_SPEC,
+  auditNumbering,
+  buildNumbering,
+  orderedInstances,
+  verifyCuts
+} from './numbering'
 
 export interface CheckResult {
   name: string
@@ -438,6 +445,83 @@ export function runSelfTest(): SelfTestReport {
       '多板种混排且 18mm 库存仅 1 张时超开并提示补采',
       ok,
       `18mm 用 ${thickSheets} 张（库存 1，需补采）、9mm 用 ${thinSheets} 张`
+    )
+  }
+
+  // 10) 按柜体/件名重排号：连号、前缀、位数溢出两条路、重复重排不叠加前缀、逐刀回看
+  {
+    const parts = [
+      makePart({ code: 'A1', name: '侧板', lenMm: 480, widMm: 398, qty: 2, cabinet: '柜A' }),
+      makePart({ code: 'A2', name: '层板', lenMm: 400, widMm: 300, qty: 3, cabinet: '柜A' }),
+      makePart({ code: 'B1', name: '门板', lenMm: 600, widMm: 300, qty: 1, cabinet: '柜B' })
+    ]
+    const job = makeJob(parts)
+    job.result = nestJob(job)
+    const plan = buildNumbering({ ...DEFAULT_SPEC, prefix: 'X-', digits: 3, startAt: 1, overflow: 'continue' }, job.result, 'manual')
+    const ordered = orderedInstances(job.result)
+    // 同柜连号（按柜内出现序），前缀只接一次
+    const byCab: Record<string, string[]> = {}
+    for (const p of ordered) (byCab[p.cabinet] ??= []).push(plan.tags[p.instanceId].full)
+    const okConsecutive = byCab['柜A'].every((f, i) => f === `X-${String(i + 1).padStart(3, '0')}`)
+    const okPrefix = byCab['柜B'][0] === 'X-001'
+    // 重复整批重排：前缀不能接两遍、结果完全一致（幂等）
+    const plan2 = buildNumbering(plan.spec, job.result, 'manual')
+    const okIdempotent = ordered.every((p) => plan2.tags[p.instanceId].full === plan.tags[p.instanceId].full)
+    // 逐刀回看：每刀落下去的件都能对上号
+    const v = verifyCuts(job, plan)
+    add(
+      '重排号：同柜连号、前缀只接一次、重复重排幂等、逐刀回看全部对号',
+      okConsecutive && okPrefix && okIdempotent && v.ok,
+      `柜A ${byCab['柜A'].join('、')}；柜B ${byCab['柜B'].join('、')}；逐刀 ${v.ok ? '通过' : v.problems.join('；')}`
+    )
+  }
+  {
+    // 位数不够：continue 只动溢出件；widen 整批改写且不截断
+    const parts = Array.from({ length: 10 }, (_, i) =>
+      makePart({ code: `C${i}`, name: `件${i}`, lenMm: 300, widMm: 200, qty: 1, cabinet: '柜C' })
+    )
+    const parts2 = Array.from({ length: 2 }, () =>
+      makePart({ code: 'D', name: 'D件', lenMm: 300, widMm: 200, qty: 1, cabinet: '柜D' })
+    )
+    const job = makeJob([...parts, ...parts2])
+    job.result = nestJob(job)
+    const cont = buildNumbering({ prefix: 'N', digits: 1, startAt: 1, overflow: 'continue' }, job.result, 'manual')
+    const wide = buildNumbering({ prefix: 'N', digits: 1, startAt: 1, overflow: 'widen' }, job.result, 'manual')
+    const cTags = orderedInstances(job.result).filter((p) => p.cabinet === '柜C').map((p) => cont.tags[p.instanceId].full)
+    const okContinue =
+      cTags.slice(0, 9).join(',') === Array.from({ length: 9 }, (_, i) => `N${i + 1}`).join(',') &&
+      cTags[9] === 'N10' && // 溢出件不截断、不补零
+      cont.totalOverflow === 1
+    const wTags = orderedInstances(job.result).map((p) => wide.tags[p.instanceId].full)
+    const okWiden = wTags.includes('N01') && wTags.includes('N10') && wide.spec.digits === 2
+    add(
+      '位数溢出：continue 仅溢出件续号（柜内连号在此断口），widen 整批加宽重排且不截断',
+      okContinue && okWiden,
+      `continue 号 ${cTags.join(',')}；widen 号 ${wTags.slice(0, 10).join(',')}`
+    )
+  }
+  {
+    // 起号自定 + 无件号/撞号被一致性核对与逐刀回看拦住
+    const job = makeJob([
+      makePart({ code: 'Z1', lenMm: 300, widMm: 200, cabinet: '柜Z' }),
+      makePart({ code: 'Z2', lenMm: 300, widMm: 200, cabinet: '柜Z' })
+    ])
+    job.result = nestJob(job)
+    const plan = buildNumbering({ prefix: '', digits: 3, startAt: 5, overflow: 'continue' }, job.result, 'manual')
+    const startsAt5 = orderedInstances(job.result)[0] && plan.tags[orderedInstances(job.result)[0].instanceId].serial === 5
+    // 人造撞号：两件同一 full
+    const bad = JSON.parse(JSON.stringify(plan)) as typeof plan
+    const ids = Object.keys(bad.tags)
+    bad.tags[ids[1]] = { ...bad.tags[ids[0]] }
+    job.numbering = bad
+    const audit = auditNumbering(job)
+    const caughtConflict = !audit.ok && audit.problems.some((p) => p.problem.includes('件号冲突'))
+    job.numbering = plan
+    const verified = verifyCuts(job, plan).ok
+    add(
+      '起号可自定；同一号撞两件时作为冲突单独点出；正常套号逐刀回看通过',
+      startsAt5 && caughtConflict && verified,
+      `起号 ${startsAt5 ? '5 通过' : '失败'}；撞号 ${caughtConflict ? '已点出' : '漏报'}`
     )
   }
 

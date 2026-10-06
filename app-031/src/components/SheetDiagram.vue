@@ -12,13 +12,16 @@ const props = withDefaults(
     draggable?: boolean
     selectedId?: string | null
     printMode?: boolean
+    /** 取重排号；不提供时退回零件编码（一致性核对会把这种情况点名） */
+    tagLookup?: (instanceId: string) => string
   }>(),
   {
     activeStep: -1,
     showCuts: false,
     draggable: false,
     selectedId: null,
-    printMode: false
+    printMode: false,
+    tagLookup: undefined
   }
 )
 
@@ -40,12 +43,18 @@ interface LabelCfg {
   showDims: boolean
   showCode: boolean
 }
-function label(pw: number, ph: number): LabelCfg {
+function partTag(p: { instanceId: string; code: string }): string {
+  const t = props.tagLookup?.(p.instanceId)
+  return t || p.code
+}
+function label(pw: number, ph: number, tag = ''): LabelCfg {
   const fs = Math.max(0, Math.min(pw / 5.2, ph / 2.4))
+  // 号（含前缀）太长时缩字号也只保留号，件名/尺寸让位
+  const tagFs = tag ? Math.min(fs, pw / Math.max(3.2, tag.length * 0.62)) : fs
   return {
-    fontSize: Math.min(40, fs),
-    showCode: fs >= 15,
-    showDims: pw >= 118 && ph >= 58 && fs >= 20
+    fontSize: Math.min(40, tagFs),
+    showCode: fs >= 12,
+    showDims: !tag && pw >= 118 && ph >= 58 && fs >= 20
   }
 }
 
@@ -188,20 +197,20 @@ function partCursor(): string {
       <text
         v-if="dragId !== p.instanceId"
         :x="p.x + p.lenMm / 2"
-        :y="p.y + p.widMm / 2 - (label(p.lenMm, p.widMm).showDims ? 6 : 0)"
+        :y="p.y + p.widMm / 2 - (label(p.lenMm, p.widMm, partTag(p)).showDims ? 6 : 0)"
         text-anchor="middle"
         dominant-baseline="middle"
         class="part-label"
-        :font-size="label(p.lenMm, p.widMm).fontSize"
-        :font-weight="label(p.lenMm, p.widMm).showDims ? 700 : 600"
+        :font-size="label(p.lenMm, p.widMm, partTag(p)).fontSize"
+        :font-weight="label(p.lenMm, p.widMm, partTag(p)).showDims ? 700 : 600"
         :style="{ cursor: partCursor() }"
         @pointerdown="onDown($event, p.instanceId)"
       >
-        <tspan v-if="label(p.lenMm, p.widMm).showCode" x="50%" dy="0">{{ p.code }}</tspan>
+        <tspan v-if="label(p.lenMm, p.widMm, partTag(p)).showCode" x="50%" dy="0">{{ partTag(p) }}</tspan>
         <tspan
-          v-if="label(p.lenMm, p.widMm).showDims"
+          v-if="label(p.lenMm, p.widMm, partTag(p)).showDims"
           x="50%"
-          :dy="label(p.lenMm, p.widMm).fontSize * 1.15"
+          :dy="label(p.lenMm, p.widMm, partTag(p)).fontSize * 1.15"
           class="part-dims"
         >{{ p.origLen }}×{{ p.origWid }}</tspan>
       </text>
@@ -212,7 +221,7 @@ function partCursor(): string {
         r="4.2"
         :fill="cabinetStroke(p.cabinet)"
       />
-      <title>{{ p.code }} {{ p.name }} {{ p.origLen }}×{{ p.origWid }}（{{ p.cabinet }}）</title>
+      <title>{{ partTag(p) }} {{ p.code }} {{ p.name }} {{ p.origLen }}×{{ p.origWid }}（{{ p.cabinet }}）</title>
     </g>
     <!-- 刀路播放 -->
     <g v-if="showCuts">
