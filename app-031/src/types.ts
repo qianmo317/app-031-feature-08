@@ -60,6 +60,39 @@ export interface CutStep {
   order: number
   kind: 'trim' | 'cut'
   label: string
+  /** 这一刀沿零件哪条边下锯（排样器/微调重算路径带出；旧档缺失时由几何归属兜底） */
+  partInstanceIds?: string[]
+}
+
+/** 零件标签重排方案：只作用于显示/打印，不允许触碰排样与刀路 */
+export type OverflowPolicy = 'continue' | 'widen'
+export type NumberingSource = 'default' | 'user' | 'migration'
+
+export interface NumberingCfg {
+  prefix: string // 自定义前缀（可为空）
+  digits: number // 号段位数（不足位数时按溢出策略处理）
+  start: number // 起始号（全批第一段号）
+  overflowPolicy: OverflowPolicy // 位数不够：continue 溢出件单独顺延 / widen 整批加宽重排
+}
+
+export interface PartTag {
+  instanceId: string
+  serial: number // 前缀后面的号
+  label: string // 完整显示号（prefix + 号段）
+  overflow: boolean // 该件是否超出指定位数（continue 策略下为不补零的顺延号）
+}
+
+export interface Numbering {
+  cfg: NumberingCfg
+  tags: PartTag[]
+  source: NumberingSource // default 新建/重排自动编号；user 用户重排；migration 老项目兼容重排
+  appliedAt: number
+}
+
+export interface NumberingIssue {
+  kind: 'overflow' | 'collision' | 'missing' | 'cut' | 'stale' | 'info'
+  message: string
+  surface?: string // 出问题的位置（哪一处）
 }
 
 export interface OffcutInfo {
@@ -122,6 +155,7 @@ export interface Job {
   trimMm: number
   useOffcutIds: string[] // 参与本单排样的登记余料
   batchByCabinet: boolean // 按柜体批次分组开料
+  numbering?: Numbering // 显示/打印用的按柜重排号（不参与排样）
   result?: NestResult
 }
 

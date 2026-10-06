@@ -14,6 +14,7 @@ interface GSeg {
   hi: number
   depIds: Set<number>
   src: DSeg[]
+  instanceIds: string[] // 合并后的贯通刀贴着哪些零件的边
 }
 
 function mergeDSegs(raw: DSeg[], kerf: number): GSeg[] {
@@ -33,6 +34,8 @@ function mergeDSegs(raw: DSeg[], kerf: number): GSeg[] {
       target.lo = Math.min(target.lo, s.lo)
       target.hi = Math.max(target.hi, s.hi)
       target.src.push(s)
+      for (const id of s.instanceIds ?? [])
+        if (!target.instanceIds.includes(id)) target.instanceIds.push(id)
     } else {
       groups.push({
         id: groups.length,
@@ -41,7 +44,8 @@ function mergeDSegs(raw: DSeg[], kerf: number): GSeg[] {
         lo: s.lo,
         hi: s.hi,
         depIds: new Set(),
-        src: [s]
+        src: [s],
+        instanceIds: [...(s.instanceIds ?? [])]
       })
     }
   }
@@ -74,6 +78,7 @@ function buildInternalSteps(raw: DSeg[], kerf: number, boardIndex: number, start
       span: [Math.round(g.lo), Math.round(g.hi)],
       order: startOrder + i,
       kind: 'cut',
+      partInstanceIds: g.instanceIds,
       label:
         g.axis === 'v'
           ? `沿 X = ${Math.round(g.at)}mm 竖切，贯通 ${Math.round(g.hi - g.lo)}mm`

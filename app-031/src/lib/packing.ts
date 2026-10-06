@@ -257,7 +257,8 @@ export function nestJob(job: Job): NestResult {
           at: fr.x + o.pw + kerf / 2,
           lo: fr.y,
           hi: fr.y + fr.h,
-          deps: parentDeps
+          deps: parentDeps,
+          instanceIds: [inst.key] // 竖刀沿本件右边
         }
       }
       if (cutY) {
@@ -266,7 +267,8 @@ export function nestJob(job: Job): NestResult {
           at: fr.y + o.ph + kerf / 2,
           lo: fr.x,
           hi: cutX ? fr.x + o.pw : fr.x + fr.w,
-          deps: rec.segA ? [rec.segA] : parentDeps
+          deps: rec.segA ? [rec.segA] : parentDeps,
+          instanceIds: [inst.key] // 横刀沿本件上边
         }
       }
       // 左条上方空档需要 segB；右侧整条空档只需要 segA
@@ -288,7 +290,8 @@ export function nestJob(job: Job): NestResult {
           at: fr.y + o.ph + kerf / 2,
           lo: fr.x,
           hi: fr.x + fr.w,
-          deps: parentDeps
+          deps: parentDeps,
+          instanceIds: [inst.key] // 横刀沿本件上边
         }
       }
       if (cutX) {
@@ -297,7 +300,8 @@ export function nestJob(job: Job): NestResult {
           at: fr.x + o.pw + kerf / 2,
           lo: fr.y,
           hi: cutY ? fr.y + o.ph : fr.y + fr.h,
-          deps: rec.segA ? [rec.segA] : parentDeps
+          deps: rec.segA ? [rec.segA] : parentDeps,
+          instanceIds: [inst.key] // 竖刀沿本件右边
         }
       }
       // 上方整条空档只需要 segA；下条右侧空档需要 segB

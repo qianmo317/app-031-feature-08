@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { computed, reactive } from 'vue'
+import { computed, reactive, ref } from 'vue'
 import { useRoute } from 'vue-router'
 import { getJob, exportJobJson } from '../lib/store'
 import { printJob, type PrintSection } from '../lib/print'
@@ -15,11 +15,12 @@ const sections = reactive<Record<PrintSection, boolean>>({
   order: true,
   labels: true
 })
+const compactLabels = ref(false)
 const sectionDefs: { key: PrintSection; name: string; desc: string }[] = [
-  { key: 'nest', name: '排样图', desc: '每张板真实比例图 + 零件编号尺寸（可贴机器旁）' },
-  { key: 'cut', name: '裁切步骤表', desc: '每一刀的方向/位置/贯通区间，按刀序排列' },
-  { key: 'order', name: '下料单/领料单', desc: '板材领料、按柜零件明细、封边与五金辅料' },
-  { key: 'labels', name: '零件标签', desc: 'A4 不干胶，每块零件一张，便于分拣' }
+  { key: 'nest', name: '排样图', desc: '每张板真实比例图 + 统一件号尺寸（可贴机器旁）' },
+  { key: 'cut', name: '裁切步骤表', desc: '每一刀的方向/位置/贯通区间/切出件号，按刀序排列' },
+  { key: 'order', name: '下料单/领料单', desc: '板材领料、按柜零件明细（带统一件号）、封边与五金辅料' },
+  { key: 'labels', name: '零件标签', desc: 'A4 不干胶，每块零件一张，号与各处一致，便于分拣' }
 ]
 
 function selected(): PrintSection[] {
@@ -31,7 +32,7 @@ function doPrint(): void {
     toast('至少勾选一项导出内容', 'bad')
     return
   }
-  printJob(route.params.id as string, list)
+  printJob(route.params.id as string, list, compactLabels.value)
 }
 function exportJson(): void {
   if (!job.value) return
@@ -60,6 +61,10 @@ function exportJson(): void {
       <div class="row" style="margin-top: 14px">
         <button class="primary" @click="doPrint">🖨 打印 / 另存 PDF</button>
         <button @click="exportJson">导出项目 JSON（备份/换机）</button>
+        <label class="row small" style="gap: 6px" title="标签小到写不下件名时：只写号不写件名，纹理/封边/见光仍保留">
+          <input type="checkbox" v-model="compactLabels" />
+          小不干胶标签（只写号不写件名；纹理/封边/见光照带）
+        </label>
         <div class="spacer" />
         <router-link :to="`/nest/${job.id}`">← 回排样图</router-link>
       </div>
@@ -73,10 +78,10 @@ function exportJson(): void {
     <section class="panel" style="margin-top: 14px">
       <h3 style="font-size: 14px; margin-bottom: 8px">导出内容预览（与打印一致）</h3>
       <ul class="small muted">
-        <li>排样图：{{ job.result?.sheets.length ?? 0 }} 张板，同柜同色，标注编号与尺寸</li>
-        <li>裁切步骤：{{ job.result?.sheets.reduce((a, s) => a + s.steps.length, 0) ?? 0 }} 条刀序（含修边）</li>
-        <li>下料单：{{ job.result ? Object.keys(job.result.boardsByType).length : 0 }} 种板材领料 + 按柜明细 + 封边五金</li>
-        <li>标签：{{ job.result?.sheets.reduce((a, s) => a + s.placements.length, 0) ?? 0 }} 张（每块零件 1 张）</li>
+        <li>排样图：{{ job.result?.sheets.length ?? 0 }} 张板，同柜同色，标注统一件号与尺寸</li>
+        <li>裁切步骤：{{ job.result?.sheets.reduce((a, s) => a + s.steps.length, 0) ?? 0 }} 条刀序（含修边），每刀列出切出件号</li>
+        <li>下料单：{{ job.result ? Object.keys(job.result.boardsByType).length : 0 }} 种板材领料 + 按柜明细（带件号）+ 封边五金</li>
+        <li>标签：{{ job.result?.sheets.reduce((a, s) => a + s.placements.length, 0) ?? 0 }} 张（每块零件 1 张）{{ compactLabels ? '· 小标签模式：只写号不写件名' : '' }}</li>
       </ul>
     </section>
   </div>

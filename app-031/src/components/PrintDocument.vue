@@ -1,19 +1,38 @@
 <script setup lang="ts">
-import { computed } from 'vue'
+import { computed, ref } from 'vue'
 import { printState } from '../lib/print'
 import { getJob } from '../lib/store'
 import boardsData from '../data/boards.json'
 import SheetDiagram from './SheetDiagram.vue'
 import { money, mm } from '../lib/format'
+import { labelOf, attributeCuts } from '../lib/numbering'
 
 const job = computed(() => (printState.jobId ? getJob(printState.jobId) : undefined))
 const sections = computed(() => new Set(printState.sections))
 const now = computed(() => new Date().toLocaleString('zh-CN'))
 
+/** 标签尺寸：常规写得下件名；紧凑（小不干胶）只写号不写件名，标记照带。 */
+const compactLabels = ref(printState.compactLabels)
+
 const allInstances = computed(() => {
   if (!job.value?.result) return []
   return job.value.result.sheets.flatMap((s) => s.placements)
 })
+
+/** 每一刀的切出件号（出处 + 几何归属），打印用 */
+const cutRowsBySheet = computed(() => {
+  if (!job.value?.result) return []
+  return job.value.result.sheets.map((s) => ({
+    sheet: s,
+    cuts: attributeCuts(s, job.value!.kerfMm).rows
+  }))
+})
+
+const edgeText = (sides: string[]): string => {
+  const map: Record<string, string> = { top: '上', bottom: '下', left: '左', right: '右' }
+  return sides.map((s) => map[s] ?? s).join('') || '无'
+}
+const tag = (instanceId: string): string => labelOf(job.value!, instanceId) ?? '?'
 
 interface OrderRow {
   code: string
@@ -24,14 +43,18 @@ interface OrderRow {
   grain: string
   edgeCount: number
   exposed: boolean
+  tags: string[] // 该种件占用的重排号（连续段）
 }
 const cabinetGroups = computed(() => {
   const map = new Map<string, OrderRow[]>()
   for (const p of allInstances.value) {
     const arr = map.get(p.cabinet) ?? []
     const cur = arr.find((r) => r.code === p.code)
-    if (cur) cur.qty++
-    else
+    const t = tag(p.instanceId)
+    if (cur) {
+      cur.qty++
+      cur.tags.push(t)
+    } else
       arr.push({
         code: p.code,
         name: p.name,
@@ -40,12 +63,23 @@ const cabinetGroups = computed(() => {
         qty: 1,
         grain: p.grain,
         edgeCount: p.edgeBands.length,
-        exposed: p.exposed
+        exposed: p.exposed,
+        tags: [t]
       })
     map.set(p.cabinet, arr)
   }
+  // 每种件号段压缩成「起~止」
+  for (const arr of map.values()) {
+    for (const r of arr) r.tags = compressTags(r.tags)
+  }
   return [...map.entries()].sort((a, b) => a[0].localeCompare(b[0], 'zh'))
 })
+
+function compressTags(labels: string[]): string[] {
+  const sorted = [...labels].sort()
+  if (sorted.length <= 2) return sorted
+  return [`${sorted[0]} ~ ${sorted[sorted.length - 1]}`]
+}
 
 const grainText = (g: string): string =>
   g === 'length' ? '竖纹' : g === 'width' ? '横纹' : '无要求'
@@ -70,25 +104,25 @@ const boardByName = (name: string) =>
           锯路 {{ job.kerfMm }}mm · 修边 {{ job.trimMm }}mm
         </p>
         <div class="print-sheet-wrap">
-          <SheetDiagram :sheet="s" :show-cuts="false" print-mode />
+          <SheetDiagram :sheet="s" :show-cuts="false" print-mode :tag-for="(id) => labelOf(job!, id)" />
         </div>
         <table class="pgrid">
           <thead>
             <tr>
-              <th>序号</th><th>编号</th><th>名称</th><th>柜体</th>
+              <th>件号（重排）</th><th>编号</th><th>名称</th><th>柜体</th>
               <th>尺寸(mm)</th><th>纹理</th><th>封边</th><th>见光</th>
             </tr>
           </thead>
           <tbody>
             <tr v-for="p in s.placements" :key="p.instanceId">
-              <td>{{ p.seq }}</td>
+              <td><b>{{ tag(p.instanceId) }}</b></td>
               <td>{{ p.code }}</td>
               <td>{{ p.name }}</td>
               <td>{{ p.cabinet }}</td>
               <td>{{ mm(p.origLen) }}×{{ mm(p.origWid) }}</td>
               <td>{{ grainText(p.grain) }}</td>
-              <td>{{ p.edgeBands.length }} 边</td>
-              <td>{{ p.exposed ? '是' : '' }}</td>
+              <td>{{ p.edgeBands.length }} 边（{{ edgeText(p.edgeBands) }}）</td>
+              <td>{{ p.exposed ? '见光' : '' }}</td>
             </tr>
           </tbody>
         </table>
@@ -98,24 +132,28 @@ const boardByName = (name: string) =>
     <!-- 裁切步骤表 -->
     <div v-if="sections.has('cut')">
       <section
-        v-for="s in job.result?.sheets ?? []"
-        :key="'pc' + s.index"
+        v-for="entry in cutRowsBySheet"
+        :key="'pc' + entry.sheet.index"
         class="print-page"
       >
-        <h2>裁切步骤表 · 第 {{ s.index + 1 }} 张（{{ s.boardName }}）</h2>
+        <h2>裁切步骤表 · 第 {{ entry.sheet.index + 1 }} 张（{{ entry.sheet.boardName }}）</h2>
         <p class="doc-meta">按顺序下锯；同向刀已连续排程（减少推台翻转）；修边刀可多板叠切。</p>
         <table class="pgrid">
           <thead>
-            <tr><th>刀序</th><th>类型</th><th>方向</th><th>位置(mm)</th><th>贯通区间(mm)</th><th>说明</th></tr>
+            <tr><th>刀序</th><th>类型</th><th>方向</th><th>位置(mm)</th><th>贯通区间(mm)</th><th>切出件号</th><th>说明</th></tr>
           </thead>
           <tbody>
-            <tr v-for="st in s.steps" :key="st.order">
-              <td>{{ st.order + 1 }}</td>
-              <td>{{ st.kind === 'trim' ? '修边' : '裁切' }}</td>
-              <td>{{ st.axis === 'v' ? '竖刀' : '横刀' }}</td>
-              <td>{{ Math.round(st.at) }}</td>
-              <td>{{ st.span[0] }} ~ {{ st.span[1] }}</td>
-              <td>{{ st.label }}</td>
+            <tr v-for="r in entry.cuts" :key="r.order">
+              <td>{{ r.order + 1 }}</td>
+              <td>{{ r.kind === 'trim' ? '修边' : '裁切' }}</td>
+              <td>{{ r.axis === 'v' ? '竖刀' : '横刀' }}</td>
+              <td>{{ Math.round(entry.sheet.steps[r.order].at) }}</td>
+              <td>{{ entry.sheet.steps[r.order].span[0] }} ~ {{ entry.sheet.steps[r.order].span[1] }}</td>
+              <td>
+                <template v-if="r.kind === 'trim'">整板修边</template>
+                <b v-else>{{ r.resolved.map((id) => tag(id)).join('、') || '—' }}</b>
+              </td>
+              <td>{{ entry.sheet.steps[r.order].label }}</td>
             </tr>
           </tbody>
         </table>
@@ -156,17 +194,18 @@ const boardByName = (name: string) =>
           <h4>柜体/房间：{{ cab }}（{{ list.reduce((a, r) => a + r.qty, 0) }} 件）</h4>
           <table class="pgrid">
             <thead>
-              <tr><th>编号</th><th>名称</th><th>尺寸(mm)</th><th>数量</th><th>纹理</th><th>封边</th><th>见光</th></tr>
+              <tr><th>件号（重排）</th><th>编号</th><th>名称</th><th>尺寸(mm)</th><th>数量</th><th>纹理</th><th>封边</th><th>见光</th></tr>
             </thead>
             <tbody>
               <tr v-for="g in list" :key="g.code">
+                <td><b>{{ g.tags.join('、') }}</b></td>
                 <td>{{ g.code }}</td>
                 <td>{{ g.name }}</td>
                 <td>{{ mm(g.origLen) }}×{{ mm(g.origWid) }}</td>
                 <td>{{ g.qty }}</td>
                 <td>{{ grainText(g.grain) }}</td>
                 <td>{{ g.edgeCount }} 边</td>
-                <td>{{ g.exposed ? '是' : '' }}</td>
+                <td>{{ g.exposed ? '见光' : '' }}</td>
               </tr>
             </tbody>
           </table>
@@ -189,18 +228,36 @@ const boardByName = (name: string) =>
       </section>
     </div>
 
-    <!-- 标签（A4 不干胶，每块一张） -->
+    <!-- 标签（A4 不干胶，每块一张；号 = 结果页/下料单/裁切表统一号） -->
     <div v-if="sections.has('labels')">
-      <section class="print-page labels-page">
+      <section class="print-page labels-page" :class="{ compact: compactLabels }">
         <div
           v-for="(p, i) in allInstances"
           :key="'lb' + i"
           class="label-card avoid-break"
         >
-          <div class="lb-code">{{ p.code }} <span class="lb-seq">#{{ p.seq }}</span></div>
-          <div class="lb-name">{{ p.name }}</div>
-          <div class="lb-dims">{{ mm(p.origLen) }} × {{ mm(p.origWid) }} mm</div>
-          <div class="lb-meta">{{ p.cabinet }} ｜ {{ grainText(p.grain) }} ｜ 封边 {{ p.edgeBands.length }} 边{{ p.exposed ? ' ｜ 见光' : '' }}</div>
+          <!-- 小标签：只写号，不写件名；纹理/封边/见光标记照带 -->
+          <template v-if="compactLabels">
+            <div class="lb-code">{{ tag(p.instanceId) }}</div>
+            <div class="lb-dims">{{ mm(p.origLen) }}×{{ mm(p.origWid) }}</div>
+            <div class="lb-meta">
+              <span v-if="p.grain !== 'none'" class="mark">{{ grainText(p.grain) }}</span>
+              <span class="mark">封{{ edgeText(p.edgeBands) }}/{{ p.edgeBands.length }}</span>
+              <span v-if="p.exposed" class="mark exp">见光</span>
+            </div>
+            <div class="lb-cab small">{{ p.cabinet }}</div>
+          </template>
+          <template v-else>
+            <div class="lb-code">{{ tag(p.instanceId) }}</div>
+            <div class="lb-name">{{ p.name }}</div>
+            <div class="lb-dims">{{ mm(p.origLen) }} × {{ mm(p.origWid) }} mm</div>
+            <div class="lb-meta">
+              {{ p.cabinet }}
+              <span v-if="p.grain !== 'none'" class="mark">｜{{ grainText(p.grain) }}</span>
+              ｜ 封边 {{ p.edgeBands.length }} 边（{{ edgeText(p.edgeBands) }}）
+              <span v-if="p.exposed" class="mark exp">｜见光</span>
+            </div>
+          </template>
         </div>
       </section>
     </div>
@@ -254,12 +311,49 @@ table.pgrid th {
   gap: 4mm 6mm;
   justify-content: center;
 }
+/* 小不干胶：标签缩小到 60×30mm，只写号不写件名 */
+.labels-page.compact {
+  grid-template-columns: repeat(3, 62mm);
+  gap: 3mm;
+}
 .label-card {
   border: 1.5px solid #000;
   border-radius: 3px;
   padding: 3mm 3.5mm;
   height: 38mm;
   overflow: hidden;
+}
+.labels-page.compact .label-card {
+  height: 30mm;
+  padding: 2mm 2.5mm;
+  display: flex;
+  flex-direction: column;
+  justify-content: center;
+  gap: 0.6mm;
+}
+.mark {
+  font-weight: 700;
+}
+.mark.exp {
+  color: #b45309;
+}
+.labels-page.compact .lb-code {
+  font-size: 17px;
+  line-height: 1.1;
+  white-space: nowrap;
+}
+.labels-page.compact .lb-dims {
+  font-size: 13px;
+  margin: 0;
+}
+.labels-page.compact .lb-meta {
+  font-size: 10px;
+  display: flex;
+  gap: 4px;
+  flex-wrap: wrap;
+}
+.labels-page.compact .lb-cab {
+  color: #333;
 }
 .lb-code {
   font-size: 15px;

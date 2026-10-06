@@ -119,6 +119,8 @@ export interface RawSeg {
   at: number
   lo: number
   hi: number
+  /** 该切割段沿着哪个/哪些零件的边（标签重排后逐刀核对用，不参与几何） */
+  instanceIds?: string[]
 }
 
 export function decomposeGuillotine(

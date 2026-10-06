@@ -5,6 +5,7 @@ import { getJob } from '../lib/store'
 import { countSawOps } from '../lib/cuts'
 import { printJob } from '../lib/print'
 import SheetDiagram from '../components/SheetDiagram.vue'
+import { attributeCuts, labelOf } from '../lib/numbering'
 
 const route = useRoute()
 const job = computed(() => getJob(route.params.id as string))
@@ -72,6 +73,20 @@ function jumpTo(i: number): void {
 function printCut(): void {
   if (job.value) printJob(job.value.id, ['cut'])
 }
+
+// 逐刀切出件号：内核出处 + 几何归属（与打印的裁切步骤表同源）
+const cutAttrib = computed(() => {
+  if (!result.value || !job.value) return []
+  return result.value.sheets.map((s) => attributeCuts(s, job.value!.kerfMm).rows)
+})
+const cutTagsOf = (order: number): string[] => {
+  const rows = cutAttrib.value[activeSheet.value]
+  const r = rows?.find((x) => x.order === order)
+  if (!r || r.kind === 'trim') return []
+  return r.resolved.map((id) => labelOf(job.value!, id) ?? '?')
+}
+const tagFor = (instanceId: string): string | null =>
+  job.value ? labelOf(job.value, instanceId) : null
 </script>
 
 <template>
@@ -105,6 +120,9 @@ function printCut(): void {
               （{{ currentStep.kind === 'trim' ? '修边' : '贯通裁切' }}）：
             </b>
             {{ currentStep.label }}
+            <b v-if="cutTagsOf(currentStep.order).length" class="cut-tags">
+              切出件号：{{ cutTagsOf(currentStep.order).join('、') }}
+            </b>
           </template>
           <template v-else>
             <b>准备就绪</b>
@@ -112,7 +130,7 @@ function printCut(): void {
           </template>
         </div>
         <div class="svg-wrap">
-          <SheetDiagram :sheet="sheet" :show-cuts="true" :active-step="cur" />
+          <SheetDiagram :sheet="sheet" :show-cuts="true" :active-step="cur" :tag-for="tagFor" />
         </div>
         <input
           type="range"
@@ -134,7 +152,10 @@ function printCut(): void {
           @click="jumpTo(st.order)"
         >
           <span class="n">{{ st.order + 1 }}</span>
-          <span class="t">{{ st.label }}</span>
+          <span class="t">
+            {{ st.label }}
+            <em v-if="cutTagsOf(st.order).length" class="cut-tag-mini">{{ cutTagsOf(st.order).join('、') }}</em>
+          </span>
         </div>
       </aside>
     </div>
@@ -218,6 +239,17 @@ function printCut(): void {
 }
 .step-row .t {
   font-size: 12px;
+}
+.cut-tags {
+  margin-left: 8px;
+  color: var(--c-primary);
+}
+.cut-tag-mini {
+  font-style: normal;
+  font-weight: 700;
+  color: var(--c-primary);
+  margin-left: 4px;
+  white-space: nowrap;
 }
 .empty {
   text-align: center;

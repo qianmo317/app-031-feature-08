@@ -48,6 +48,34 @@ const utilMinMax = computed(() => {
   if (us.length === 0) return { min: 0, max: 0 }
   return { min: Math.min(...us), max: Math.max(...us) }
 })
+
+// 按柜体列件数 + 统一号段（与拼版图/标签/下料单同源）
+const cabinetCounts = computed(() => {
+  if (!job.value?.result) return []
+  const map = new Map<string, { count: number; tags: { serial: number; label: string; overflow: boolean }[] }>()
+  for (const s of job.value.result.sheets) {
+    for (const p of s.placements) {
+      const t = job.value.numbering?.tags.find((x) => x.instanceId === p.instanceId)
+      const arr = map.get(p.cabinet) ?? { count: 0, tags: [] }
+      arr.count++
+      if (t) arr.tags.push(t)
+      map.set(p.cabinet, arr)
+    }
+  }
+  return [...map.entries()]
+    .sort((a, b) => a[0].localeCompare(b[0], 'zh'))
+    .map(([cabinet, v]) => {
+      const ts = v.tags.sort((a, b) => a.serial - b.serial)
+      const broken = ts.some((t, i) => i > 0 && t.serial !== ts[i - 1].serial + 1)
+      return {
+        cabinet,
+        count: v.count,
+        from: ts[0]?.label ?? '?',
+        to: ts[ts.length - 1]?.label ?? '?',
+        broken
+      }
+    })
+})
 </script>
 
 <template>
@@ -129,6 +157,36 @@ const utilMinMax = computed(() => {
           </tbody>
         </table>
         <p class="small muted">共 {{ totalPieces }} 件零件。</p>
+      </section>
+
+      <section class="panel">
+        <h3>按柜体件数（分拣用）</h3>
+        <table class="grid">
+          <thead>
+            <tr><th>柜体/房间</th><th>件数</th><th>统一号段</th><th>连号</th></tr>
+          </thead>
+          <tbody>
+            <tr v-for="r in cabinetCounts" :key="r.cabinet">
+              <td>{{ r.cabinet }}</td>
+              <td>{{ r.count }}</td>
+              <td><b>{{ r.from }} ~ {{ r.to }}</b></td>
+              <td>
+                <span :class="r.broken ? 'tag bad' : 'tag good'">
+                  {{ r.broken ? '有断开' : '连号' }}
+                </span>
+              </td>
+            </tr>
+            <tr v-if="cabinetCounts.length === 0">
+              <td colspan="4" class="muted small">暂无已排零件</td>
+            </tr>
+          </tbody>
+          <tfoot>
+            <tr><td><b>合计</b></td><td><b>{{ totalPieces }}</b></td><td colspan="2"></td></tr>
+          </tfoot>
+        </table>
+        <p class="small muted" style="margin-top: 6px">
+          号段与结果页拼版标注、标签打印、下料单、裁切步骤表为同一套号；一处重排，此处同步更新。
+        </p>
       </section>
 
       <section class="panel">

@@ -1,10 +1,18 @@
 // 全局状态：Vue reactive 单例 + localStorage 持久化（无 Pinia/Vuex）
 import { reactive, computed } from 'vue'
-import type { Board, Job, NestResult, Part, RegisteredOffcut, SheetResult } from '../types'
+import type { Board, Job, NestResult, Part, RegisteredOffcut, SheetResult, Numbering, NumberingCfg } from '../types'
 import { nestJob } from './packing'
 import { rebuildFromPlacements } from './cuts'
 import { guillotineViolation } from './geometry'
 import { uid } from './format'
+import {
+  defaultCfg,
+  planNumbering,
+  numberingAudit,
+  kernelFingerprint,
+  validateCfg,
+  type NumberingAudit
+} from './numbering'
 import boardsData from '../data/boards.json'
 
 const JOBS_KEY = 'fco.jobs.v1'
@@ -43,7 +51,48 @@ function init(): void {
   if (state.loaded) return
   state.jobs = load<Job[]>(JOBS_KEY, [])
   state.offcuts = load<RegisteredOffcut[]>(OFFCUTS_KEY, [])
+  // 老档兼容：缺字段不能打不开；有排样结果却没有重排号的，按默认规则补一套并标明 migration
+  for (const j of state.jobs) normalizeJob(j)
   state.loaded = true
+}
+
+/** 归一化一个项目：补齐所有后加字段；老项目缺柜体/编号方案时走兼容路径。 */
+export function normalizeJob(obj: Partial<Job>): Job {
+  const job = obj as Job
+  job.useOffcutIds = Array.isArray(job.useOffcutIds) ? job.useOffcutIds : []
+  job.batchByCabinet = typeof job.batchByCabinet === 'boolean' ? job.batchByCabinet : false
+  if (!Array.isArray(job.boards)) job.boards = []
+  if (!Array.isArray(job.parts)) job.parts = []
+  for (const p of job.parts) {
+    if (typeof p.cabinet !== 'string' || !p.cabinet) p.cabinet = '未分组'
+  }
+  if (job.numbering && validateJobNumbering(job.numbering)) {
+    // 已有的重排号：校验覆盖；覆盖不全则不当新号用，整套管重新生成
+    const ids = new Set((job.result?.sheets ?? []).flatMap((s) => s.placements.map((p) => p.instanceId)))
+    const cover = job.numbering.tags.every((t) => ids.has(t.instanceId))
+    const complete = [...ids].every((id) => job.numbering!.tags.some((t) => t.instanceId === id))
+    if (!cover || !complete) job.numbering = undefined
+  } else {
+    job.numbering = undefined
+  }
+  if (!job.numbering && job.result?.sheets.length) {
+    // 老号（placement.seq，摆上去的先后）绝不当新号用：按默认规则重排一套并标明
+    job.numbering = buildNumbering(job, defaultCfg(), 'migration')
+  }
+  return job
+}
+
+function validateJobNumbering(n: Numbering): boolean {
+  if (!n || typeof n !== 'object') return false
+  if (validateCfg(n.cfg).length) return false
+  if (!Array.isArray(n.tags)) return false
+  return n.source === 'default' || n.source === 'user' || n.source === 'migration'
+}
+
+/** 由当前排样结果生成一套号（纯计算包装）。 */
+function buildNumbering(job: Job, cfg: NumberingCfg, source: Numbering['source']): Numbering {
+  const plan = planNumbering(job.result!.sheets, cfg)
+  return { cfg: { ...cfg, digits: plan.effectiveDigits }, tags: plan.tags, source, appliedAt: Date.now() }
 }
 
 export function defaultBoards(): Board[] {
@@ -105,6 +154,8 @@ export function duplicateJob(id: string): Job | null {
   job.name = `${src.name} 副本`
   job.createdAt = Date.now()
   job.result = undefined
+  job.numbering = undefined
+  normalizeJob(job)
   state.jobs.unshift(job)
   persist()
   return job
@@ -152,8 +203,76 @@ export function runNest(job: Job): NestResult {
     }
   }
   job.result = result
+  // 排样结果变了：重排号基于「件」(instanceId)，新结果里实例全部是新的，
+  // 旧号必然覆盖不上，按既有方案重发一套；没有方案就用默认规则。
+  // 注意：这不是「重排」，号随排样结果重新生成，source 取 default。
+  if (result.sheets.length) {
+    const cfg = job.numbering?.cfg ?? defaultCfg()
+    job.numbering = buildNumbering(job, cfg, 'default')
+  } else {
+    job.numbering = undefined
+  }
   persist()
   return result
+}
+
+export interface ApplyRenumberResult {
+  ok: boolean
+  audit: NumberingAudit | null
+  errors: string[]
+  plan: ReturnType<typeof planNumbering> | null
+  rolledBack: boolean
+}
+
+/**
+ * 用户重排：一次写成（原子）。
+ * - 写前快照整份项目；写完逐刀审计（模拟 + 出处核对 + 六处覆盖 + 存储往返），
+ *   任何拦截性问题都回退到快照，不留半套号。
+ * - 摆法/刀路指纹前后必须一致，否则同样回退（内核不许跟着动）。
+ * - 重复点：直接覆盖 numbering（前缀来自输入框而非叠加），不会接两遍。
+ */
+export function applyRenumber(job: Job, cfg: NumberingCfg): ApplyRenumberResult {
+  const errors = validateCfg(cfg)
+  if (!job.result) return { ok: false, audit: null, errors: [...errors, '该项目还没有排样结果'], plan: null, rolledBack: false }
+  if (errors.length) return { ok: false, audit: null, errors, plan: null, rolledBack: false }
+
+  const snapshot = JSON.stringify(job)
+  const beforeKernel = kernelFingerprint(job)
+  try {
+    const plan = planNumbering(job.result.sheets, cfg)
+    job.numbering = {
+      cfg: { ...cfg, digits: plan.effectiveDigits },
+      tags: plan.tags,
+      source: 'user',
+      appliedAt: Date.now()
+    }
+    const afterKernel = kernelFingerprint(job)
+    if (afterKernel !== beforeKernel) {
+      throw new Error('重排导致摆法或刀路发生变化（内核被改动），已回退')
+    }
+    const audit = numberingAudit(job)
+    // 存储往返校验
+    const roundtrip = JSON.parse(JSON.stringify(job)) as Job
+    if (JSON.stringify(roundtrip.numbering) !== JSON.stringify(job.numbering)) {
+      throw new Error('重排号无法完整写入本机存储，已回退')
+    }
+    if (!audit.ok) {
+      throw new Error(audit.issues.map((i) => i.message).join('；'))
+    }
+    persist()
+    return { ok: true, audit, errors: [], plan, rolledBack: false }
+  } catch (e) {
+    const restored = JSON.parse(snapshot) as Job
+    Object.assign(job, restored)
+    const msg = e instanceof Error ? e.message : String(e)
+    return {
+      ok: false,
+      audit: null,
+      errors: [`写入一半失败，已整份回退：${msg}`],
+      plan: null,
+      rolledBack: true
+    }
+  }
 }
 
 /** 手工微调：移动/交换后重新校验 guillotine 并重算刀路；非法返回错误信息。 */
@@ -362,14 +481,17 @@ export function exportJobJson(job: Job): string {
 
 export function importJobJson(json: string): Job | null {
   try {
-    const obj = JSON.parse(json) as Job
+    const obj = JSON.parse(json) as Partial<Job>
     if (!obj.parts || !obj.boards) return null
     obj.id = uid('job')
     obj.createdAt = Date.now()
+    // 导入的排样结果是在原机器/原版本下产生的，号不作为新号带入，重新排样后再给默认号
     obj.result = undefined
-    state.jobs.unshift(obj)
+    obj.numbering = undefined
+    const job = normalizeJob(obj)
+    state.jobs.unshift(job)
     persist()
-    return obj
+    return job
   } catch {
     return null
   }

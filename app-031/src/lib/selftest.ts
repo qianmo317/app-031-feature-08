@@ -5,6 +5,15 @@ import type { Board, Job, Part } from '../types'
 import { nestJob } from './packing'
 import { simulate, countSawOps } from './cuts'
 import { guillotineViolation, type Rect } from './geometry'
+import {
+  planNumbering,
+  numberingAudit,
+  defaultCfg,
+  orderedPlacements,
+  attributeCuts,
+  kernelFingerprint
+} from './numbering'
+import { normalizeJob } from './store'
 
 export interface CheckResult {
   name: string
@@ -439,6 +448,154 @@ export function runSelfTest(): SelfTestReport {
       ok,
       `18mm 用 ${thickSheets} 张（库存 1，需补采）、9mm 用 ${thinSheets} 张`
     )
+  }
+
+  // 10) 标签按柜体重排：同柜连号、前缀/位数/起点、溢出两策略、幂等、逐刀核对、内核不动
+  {
+    const parts = [
+      makePart({ code: 'A1', name: '侧板', lenMm: 400, widMm: 300, qty: 3, cabinet: '衣柜' }),
+      makePart({ code: 'B1', name: '门板', lenMm: 380, widMm: 280, qty: 2, cabinet: '衣柜' }),
+      makePart({ code: 'C1', name: '底板', lenMm: 500, widMm: 200, qty: 2, cabinet: '橱柜' })
+    ]
+    const job = makeJob(parts)
+    const r = nestJob(job)
+    job.result = r
+
+    // 10a 排序：柜体 → 件名（同柜件必须连续出现；柜内按件名有序）
+    const ordered = orderedPlacements(r.sheets).map((p) => `${p.cabinet}/${p.name}`)
+    const runs: [string, number][] = []
+    for (const item of ordered) {
+      const cab = item.split('/')[0]
+      const last = runs[runs.length - 1]
+      if (last && last[0] === cab) last[1]++
+      else runs.push([cab, 1])
+    }
+    const yiIdx = ordered.findIndex((x) => x.startsWith('衣柜/'))
+    const yiNames = ordered.filter((x) => x.startsWith('衣柜/')).map((x) => x.split('/')[1])
+    const yiSorted = yiNames.every((n, i) => i === 0 || n.localeCompare(yiNames[i - 1], 'zh') >= 0)
+    const orderOk =
+      runs.length === 2 &&
+      runs[0][0] === '橱柜' && runs[0][1] === 2 &&
+      runs[1][0] === '衣柜' && runs[1][1] === 5 &&
+      yiIdx >= 0 && yiSorted
+    add('重排顺序按 柜体→件名（同柜连号）', orderOk,
+      `柜体连续段：${runs.map(([c, n]) => `${c}×${n}`).join('，')}；衣柜内：${yiNames.join('→')}`)
+
+    // 10b 前缀/位数/起点
+    const cfg = { ...defaultCfg(), prefix: 'A-', digits: 2, start: 5 }
+    const plan = planNumbering(r.sheets, cfg)
+    const first = plan.tags[0]
+    const last = plan.tags[plan.tags.length - 1]
+    const basicOk =
+      plan.tags.length === 7 && first.label === 'A-05' && first.serial === 5 && last.serial === 11
+    add('前缀+位数零填+起点 生效，全批连续', basicOk, `${first.label} … ${last.label}`)
+
+    // 10c 同柜连号（号段连续）
+    const cabinetSerials = new Map<string, number[]>()
+    for (const s of r.sheets)
+      for (const p of s.placements) {
+        const t = plan.tags.find((x) => x.instanceId === p.instanceId)!
+        const arr = cabinetSerials.get(p.cabinet) ?? []
+        arr.push(t.serial)
+        cabinetSerials.set(p.cabinet, arr)
+      }
+    let chainOk = true
+    for (const arr of cabinetSerials.values()) {
+      arr.sort((a, b) => a - b)
+      for (let i = 1; i < arr.length; i++) if (arr[i] !== arr[i - 1] + 1) chainOk = false
+    }
+    add('同一柜体的件连号', chainOk, [...cabinetSerials].map(([c, a]) => `${c}:${a.join('/')}`).join('，'))
+
+    // 10d 溢出 continue：不截断、不补零、原样写出，其余件不动
+    const bigParts: Part[] = [
+      makePart({ code: 'OV', name: '层板', lenMm: 200, widMm: 180, qty: 12, cabinet: '顶柜' })
+    ]
+    const jobOv = makeJob(bigParts)
+    const rOv = nestJob(jobOv)
+    jobOv.result = rOv
+    const cfgCont = { ...defaultCfg(), prefix: '', digits: 1, start: 1, overflowPolicy: 'continue' as const }
+    const planCont = planNumbering(rOv.sheets, cfgCont)
+    const ovf = planCont.tags.filter((t) => t.overflow)
+    const contOk =
+      rOv.sheets.reduce((a, s) => a + s.placements.length, 0) === 12 &&
+      ovf.length === 3 &&
+      planCont.tags[8].label === '9' &&
+      !planCont.tags[8].overflow &&
+      planCont.tags[9].label === '10' &&
+      planCont.tags[9].overflow &&
+      planCont.tags[0].label === '1'
+    add('位数不够(continue)：溢出件不截断、不补零，别件不动', contOk,
+      `溢出 ${ovf.length} 件，第 9 件「${planCont.tags[8].label}」，第 10 件「${planCont.tags[9].label}」`)
+
+    // 10e 溢出 widen：整批加宽，没有溢出件
+    const cfgWide = { ...defaultCfg(), digits: 1, start: 1, overflowPolicy: 'widen' as const }
+    const planWide = planNumbering(rOv.sheets, cfgWide)
+    const wideOk =
+      planWide.widened === true &&
+      planWide.effectiveDigits === 2 &&
+      planWide.tags.every((t) => !t.overflow) &&
+      planWide.tags[0].label === '01' &&
+      planWide.tags[9].label === '10'
+    add('位数不够(widen)：整批加宽重排且连号完整', wideOk,
+      `加宽至 ${planWide.effectiveDigits} 位，${planWide.tags[0].label}…${planWide.tags[9].label}`)
+
+    // 10f 逐刀核对：出处 + 几何归属一致，每把内部刀至少切一件、每件都能被切出
+    const withN: Job = { ...job, numbering: { cfg, tags: plan.tags, source: 'user', appliedAt: 0 } }
+    let cutOk = true
+    let cutDetail = ''
+    for (const sheet of r.sheets) {
+      const { rows, problems } = attributeCuts(sheet, job.kerfMm)
+      if (problems.length) {
+        cutOk = false
+        cutDetail = problems.map((p) => p.message).join('；')
+      }
+      for (const row of rows) if (row.kind === 'cut' && row.resolved.length === 0) cutOk = false
+    }
+    const audit = numberingAudit(withN)
+    add(
+      '逐刀回看：每刀切出件可归属、出处与几何一致、审计通过',
+      cutOk && audit.ok,
+      !audit.ok ? audit.issues.map((i) => i.message).join('；') : cutDetail || '六处取号口一致，逐刀号对得上'
+    )
+
+    // 10g 内核指纹：贴号前后摆法与刀路不变
+    const fpBefore = kernelFingerprint(withN)
+    const plan2 = planNumbering(r.sheets, { ...cfg, prefix: 'B-' })
+    withN.numbering = { cfg: { ...cfg, prefix: 'B-' }, tags: plan2.tags, source: 'user', appliedAt: 1 }
+    const fpAfter = kernelFingerprint(withN)
+    add('重排不触碰排样内核（摆法/刀路指纹不变）', fpBefore === fpAfter,
+      fpBefore === fpAfter ? '指纹一致' : '摆法或刀路被改动')
+
+    // 10h 幂等：同参数再排一遍，号完全一样（不会把前缀接两遍）
+    const again = planNumbering(r.sheets, { ...cfg, prefix: 'A-' })
+    const idem = JSON.stringify(again.tags) === JSON.stringify(plan.tags)
+    add('重复重排幂等（前缀不叠加、号不变）', idem,
+      idem ? '二次结果与一次相同' : '二次重排号发生漂移')
+  }
+
+  // 11) 老项目兼容：缺 numbering/cabinet 字段能读；按默认规则重排并标 migration，老号不当新号
+  {
+    const parts = [
+      makePart({ code: 'OLD1', lenMm: 400, widMm: 300, cabinet: '衣柜' }),
+      makePart({ code: 'OLD2', lenMm: 360, widMm: 260, cabinet: '橱柜' })
+    ]
+    const job = makeJob(parts)
+    const r = nestJob(job)
+    job.result = r
+    // 模拟老档：删掉 numbering（并把某个件的 cabinet 删掉）
+    delete (job as { numbering?: unknown }).numbering
+    ;(job.parts[1] as { cabinet?: string }).cabinet = undefined as unknown as string
+    const fixed = normalizeJob(job)
+    const ok =
+      !!fixed.numbering &&
+      fixed.numbering.source === 'migration' &&
+      fixed.parts.every((p) => typeof p.cabinet === 'string' && p.cabinet.length > 0) &&
+      fixed.numbering.tags.length === r.sheets.reduce((a, s) => a + s.placements.length, 0) &&
+      // 老摆放序号 seq 不应出现在任何重排标签里
+      !fixed.numbering.tags.some((t) => t.label === String(r.sheets[0].placements[0].seq)) &&
+      numberingAudit(fixed).ok
+    add('老档缺柜体/编号字段可打开：默认重排并标 migration，老号不当新号', ok,
+      ok ? `标签 ${fixed.numbering?.tags.map((t) => t.label).join('/')}` : '兼容迁移失败')
   }
 
   const elapsedMs = Math.round(performance.now() - t0)
